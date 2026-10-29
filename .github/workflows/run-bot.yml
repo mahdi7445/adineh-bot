@@ -1,0 +1,51 @@
+name: اجرای ربات (تست ۲۴ ساعته)
+
+# ربات را در بازه‌های ~۵.۷ ساعته اجرا می‌کند و بلافاصله نوبت بعدی را می‌گذارد.
+# داده‌ها رمزنگاری‌شده در شاخه «state» همین مخزن خصوصی ذخیره می‌شوند.
+# کلید روشن/خاموش: Settings ← Secrets and variables ← Actions ← Variables ← BOT_ENABLED = true / false
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/20 * * * *"   # نگهبان: اگر اجرایی در جریان یا در صف نبود، شروع می‌کند
+
+concurrency:
+  group: adineh-bot          # هرگز دو نسخه هم‌زمان (وگرنه تلگرام خطای Conflict می‌دهد)
+  cancel-in-progress: false
+
+permissions:
+  contents: write            # فقط برای حالت مخزن خصوصی؛ در حالت عمومی داده در STATE_REPO نوشته می‌شود
+
+jobs:
+  run:
+    if: ${{ vars.BOT_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+      DATA_KEY: ${{ secrets.DATA_KEY }}
+      CENTER_NAME: ${{ vars.CENTER_NAME || 'مرکز توانبخشی آدینه' }}
+      CONTACT_TEXT: ${{ vars.CONTACT_TEXT }}
+      DATA_DIR: data
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      STATE_REPO: ${{ vars.STATE_REPO }}          # مخزن خصوصی جدا برای داده‌ها (برای ریپوی عمومی الزامی)
+      STATE_TOKEN: ${{ secrets.STATE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: بازیابی داده‌ها
+        run: bash tools/state.sh restore
+      - name: اجرای ربات
+        run: |
+          ( while true; do sleep 600; bash tools/state.sh save || echo "save failed"; done ) &
+          SAVER=$!
+          timeout --signal=INT --kill-after=60 345m python -m bot.main || true
+          kill $SAVER 2>/dev/null || true
+      - name: ذخیره نهایی داده‌ها
+        if: always()
+        run: bash tools/state.sh save
