@@ -1,0 +1,88 @@
+name: اجرای ربات (۲۴ ساعته)
+
+# ربات در بازه‌های ~۵.۷ ساعته اجرا می‌شود (سقف ۶ ساعتهٔ گیت‌هاب) و در پایان هر اجرا، همان لحظه
+# اجرای بعدی را خودش راه می‌اندازد (workflow_dispatch)؛ پس به زمان‌بندی (cron) وابسته نیست.
+# cron هر ۲۰ دقیقه فقط «نگهبان پشتیبان» است: اگر هیچ اجرایی در جریان یا صف نبود، یکی شروع می‌کند.
+# (گیت‌هاب زمان‌بندی‌ها را گاهی با تأخیر اجرا می‌کند یا بعد از ۶۰ روز بی‌فعالیتی غیرفعال می‌کند؛ زنجیرهٔ dispatch از این‌ها اثر نمی‌پذیرد.)
+# کلید روشن/خاموش: Settings ← Secrets and variables ← Actions ← Variables ← BOT_ENABLED = true / false
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/20 * * * *"
+
+concurrency:
+  group: adineh-bot          # هرگز دو نسخه هم‌زمان (وگرنه تلگرام خطای Conflict می‌دهد)
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write             # برای راه‌اندازی اجرای بعدی
+
+jobs:
+  check:
+    if: ${{ vars.BOT_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.c.outputs.go }}
+    steps:
+      - id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          n=$(gh api "repos/${{ github.repository }}/actions/workflows/run-bot.yml/runs?per_page=30" \
+              --jq '[.workflow_runs[] | select((.status=="in_progress" or .status=="queued" or .status=="pending" or .status=="waiting") and .id != ${{ github.run_id }})] | length' 2>/dev/null || echo 0)
+          if [ "${n:-0}" -gt 0 ]; then echo "go=false" >> "$GITHUB_OUTPUT"; else echo "go=true" >> "$GITHUB_OUTPUT"; fi
+
+  run:
+    needs: check
+    if: ${{ needs.check.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+      DATA_KEY: ${{ secrets.DATA_KEY }}
+      CENTER_NAME: ${{ vars.CENTER_NAME || 'مرکز توانبخشی آدینه' }}
+      CONTACT_TEXT: ${{ vars.CONTACT_TEXT }}
+      DATA_DIR: data
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      STATE_REPO: ${{ vars.STATE_REPO }}          # مخزن خصوصی جدا برای داده‌ها (برای ریپوی عمومی الزامی)
+      STATE_TOKEN: ${{ secrets.STATE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: نصب ffmpeg (ویدیوی دوربین)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: بازیابی داده‌ها
+        id: restore
+        run: bash tools/state.sh restore
+      - name: اجرای ربات
+        id: bot
+        run: |
+          date +%s > /tmp/bot_started
+          ( while true; do sleep 600; bash tools/state.sh save || echo "save failed"; done ) &
+          SAVER=$!
+          timeout --signal=INT --kill-after=60 345m python -m bot.main || true
+          kill $SAVER 2>/dev/null || true
+      - name: ذخیره نهایی داده‌ها
+        if: always()
+        run: bash tools/state.sh save
+      - name: راه‌اندازی اجرای بعدی (زنجیره)
+        if: always() && vars.BOT_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # اگر ربات فوراً از کار افتاد یا بازیابی داده خطا داد، کمی صبر می‌کنیم تا حلقهٔ خطای سریع ساخته نشود
+          wait=0
+          if [ "${{ steps.restore.outcome }}" != "success" ] || [ "${{ steps.bot.outcome }}" != "success" ]; then wait=600
+          elif [ -f /tmp/bot_started ] && [ $(( $(date +%s) - $(cat /tmp/bot_started) )) -lt 300 ]; then wait=300; fi
+          [ "$wait" -gt 0 ] && { echo "صبر ${wait} ثانیه قبل از تلاش بعدی"; sleep "$wait"; }
+          gh workflow run run-bot.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
